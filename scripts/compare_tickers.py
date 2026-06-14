@@ -13,6 +13,7 @@ Runs the same core logic as nb_03 (dividend safety) and nb_05 (DDM/DCF/reverse D
   - FCF payout weighted >= earnings in safety score (shared utils/valuation.py)
   - DDM suppressed when yield < 2% or FCF payout > 90%
   - Reverse DCF implied growth at current price
+  - Optional 13% FCF-growth DCF scenario (Dividendology base case, e.g. MA)
   - yfinance FCF payout when SEC data is missing or unreliable
   - Negative book equity → Net Debt/FCF leverage (MO-style buyback issuers)
   - Optional qualitative flags (patent cliff, Amazon transition, etc.)
@@ -58,6 +59,9 @@ warnings.filterwarnings("ignore")
 
 # ── Dividendology reference set (YouTube / Substack coverage) ─────────────────
 
+# Base-case FCF growth used in Dividendology DCF walkthroughs (e.g. MA @ 13%).
+DCF_SCENARIO_GROWTH = 0.13
+
 DIVIDENDOLOGY_WATCHLIST: dict[str, dict[str, str]] = {
     "ASML": {
         "topic": "Is ASML Stock a Buy Now?",
@@ -101,6 +105,12 @@ DIVIDENDOLOGY_WATCHLIST: dict[str, dict[str, str]] = {
         "stance": "bearish",
         "summary": "Dividend exceeds FCF; patent cliff; debt from acquisitions; distressed yield.",
     },
+    "MA": {
+        "topic": "3 Undervalued Dividend Stocks!",
+        "category": "Financials / Payments",
+        "stance": "bullish",
+        "summary": "5Y-low P/E; 16% FCF payout; 15%+ 10Y div CAGR; DCF @ 13% FCF growth suggests upside.",
+    },
 }
 
 
@@ -130,6 +140,8 @@ class TickerComparison:
     ddm_mos: float | None = None
     dcf_fv: float | None = None
     dcf_mos: float | None = None
+    dcf_fv_scenario: float | None = None
+    dcf_mos_scenario: float | None = None
     reverse_dcf_growth: float | None = None
     ddm_skipped: bool = False
     ddm_skip_reason: str = ""
@@ -366,6 +378,9 @@ def analyze_ticker(ticker: str, ref: dict[str, str] | None = None) -> TickerComp
                     5,
                 )
         row.dcf_fv, row.dcf_mos = compute_dcf(fcf_ps, fcf_g, row.price)
+        row.dcf_fv_scenario, row.dcf_mos_scenario = compute_dcf(
+            fcf_ps, DCF_SCENARIO_GROWTH, row.price
+        )
         if row.price:
             row.reverse_dcf_growth = compute_reverse_dcf(fcf_ps, row.price)
 
@@ -405,6 +420,8 @@ def comparison_to_dataframe(rows: list[TickerComparison]) -> pd.DataFrame:
             "DDM MoS": r.ddm_mos,
             "DCF FV": r.dcf_fv,
             "DCF MoS": r.dcf_mos,
+            f"DCF FV @ {DCF_SCENARIO_GROWTH:.0%}g": r.dcf_fv_scenario,
+            f"DCF MoS @ {DCF_SCENARIO_GROWTH:.0%}g": r.dcf_mos_scenario,
             "Reverse DCF g": r.reverse_dcf_growth,
             "DDM Skipped": r.ddm_skipped,
             "DDM Skip Reason": r.ddm_skip_reason,
@@ -447,7 +464,16 @@ def print_report(df: pd.DataFrame) -> None:
         if pd.notna(row["DCF MoS"]):
             mos = row["DCF MoS"] * 100
             tag = "discount" if mos > 0 else "premium"
-            print(f"   DCF fair value: ${row['DCF FV']:.0f} ({abs(mos):.0f}% {tag} vs price)")
+            print(f"   DCF fair value (hist FCF CAGR): ${row['DCF FV']:.0f} ({abs(mos):.0f}% {tag} vs price)")
+        scenario_mos_col = f"DCF MoS @ {DCF_SCENARIO_GROWTH:.0%}g"
+        scenario_fv_col = f"DCF FV @ {DCF_SCENARIO_GROWTH:.0%}g"
+        if pd.notna(row.get(scenario_mos_col)):
+            mos = row[scenario_mos_col] * 100
+            tag = "discount" if mos > 0 else "premium"
+            print(
+                f"   DCF @ {DCF_SCENARIO_GROWTH:.0%} FCF growth: "
+                f"${row[scenario_fv_col]:.0f} ({abs(mos):.0f}% {tag} vs price)"
+            )
         if pd.notna(row.get("Reverse DCF g")):
             print(f"   Reverse DCF implied FCF growth: {row['Reverse DCF g']*100:.1f}%")
         if row.get("DDM Skip Reason"):

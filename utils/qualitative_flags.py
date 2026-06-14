@@ -81,6 +81,23 @@ QUALITATIVE_FLAGS: dict[str, list[QualitativeFlag]] = {
             "Seagen and other deals added leverage; dividend yield may be a value trap.",
         ),
     ],
+    "MA": [
+        QualitativeFlag(
+            "Multiple compression",
+            "opportunity",
+            "EPS grew ~160% over 5Y while price lagged; P/E at multi-year low vs ~32x historical avg.",
+        ),
+        QualitativeFlag(
+            "Regulation (interest caps)",
+            "watch",
+            "MA earns network fees, not interest income — bank rate-cap risk is largely indirect.",
+        ),
+        QualitativeFlag(
+            "Stablecoins & agentic commerce",
+            "opportunity",
+            "More digital transactions and AI-driven commerce still need fraud, settlement, and compliance rails.",
+        ),
+    ],
 }
 
 
