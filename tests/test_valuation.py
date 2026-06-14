@@ -13,6 +13,7 @@ from utils.valuation import (  # noqa: E402
     compute_reverse_dcf,
     compute_safety_score,
     ddm_applicable,
+    score_balance_sheet_leverage,
 )
 
 
@@ -41,3 +42,29 @@ def test_reverse_dcf_near_forward_growth():
     implied = compute_reverse_dcf(fcf_ps, fv)
     assert implied is not None
     assert abs(implied - growth) < 0.005
+
+
+def test_negative_equity_uses_net_debt_over_fcf():
+    """MO-style negative book equity should score via Net Debt/FCF, not skip leverage."""
+    result = score_balance_sheet_leverage(
+        -7.4,
+        stockholders_equity=-3_452_000_000,
+        net_debt=21_235_000_000,
+        free_cash_flow=9_074_000_000,
+    )
+    assert result is not None
+    score, category, note = result
+    assert category == "Net Debt / FCF"
+    assert "Negative book equity" in note
+    assert score == 55  # ~2.3x net debt / FCF → elevated but manageable band
+
+    overall, _, rows = compute_safety_score(
+        1.01, 0.77, 16, -7.4,
+        stockholders_equity=-3_452_000_000,
+        net_debt=21_235_000_000,
+        free_cash_flow=9_074_000_000,
+    )
+    cats = [r["Category"] for r in rows]
+    assert "Net Debt / FCF" in cats
+    assert overall is not None
+    assert overall > 44  # leverage component now included vs pre-Phase-4 skip

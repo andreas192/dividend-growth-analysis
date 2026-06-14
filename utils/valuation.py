@@ -38,6 +38,56 @@ def _score_debt_to_equity(v: float) -> tuple[int, str]:
     return 25, "High leverage"
 
 
+def _score_net_debt_to_cash_flow(ratio: float) -> tuple[int, str]:
+    if ratio < 1.0:
+        return 100, f"Net debt {ratio:.1f}x FCF — low leverage"
+    if ratio < 2.0:
+        return 80, f"Net debt {ratio:.1f}x FCF — manageable"
+    if ratio < 3.0:
+        return 55, f"Net debt {ratio:.1f}x FCF — elevated"
+    return 25, f"Net debt {ratio:.1f}x FCF — high leverage"
+
+
+def score_balance_sheet_leverage(
+    debt_to_equity: float | None,
+    *,
+    stockholders_equity: float | None = None,
+    net_debt: float | None = None,
+    free_cash_flow: float | None = None,
+    operating_cash_flow: float | None = None,
+) -> tuple[int, str, str] | None:
+    """
+    Score balance-sheet leverage for dividend safety.
+
+    When book equity is zero or negative (e.g. MO after buybacks), D/E is not
+    meaningful — fall back to Net Debt / FCF (or OCF).
+    """
+    negative_equity = (
+        stockholders_equity is not None and stockholders_equity <= 0
+    ) or (debt_to_equity is not None and debt_to_equity < 0)
+
+    if negative_equity:
+        cash_flow = None
+        cf_label = "FCF"
+        if free_cash_flow is not None and free_cash_flow > 0:
+            cash_flow = free_cash_flow
+        elif operating_cash_flow is not None and operating_cash_flow > 0:
+            cash_flow = operating_cash_flow
+            cf_label = "OCF"
+        if net_debt is not None and cash_flow is not None and cash_flow > 0:
+            ratio = net_debt / cash_flow
+            score, note = _score_net_debt_to_cash_flow(ratio)
+            note = note.replace("FCF", cf_label)
+            prefix = "Negative book equity — "
+            return score, f"Net Debt / {cf_label}", prefix + note
+        return None
+
+    if debt_to_equity is not None and debt_to_equity > 0:
+        score, note = _score_debt_to_equity(debt_to_equity)
+        return score, "Debt/Equity", note
+    return None
+
+
 def _score_streak(streak: int) -> tuple[int, str]:
     if streak >= 25:
         return 100, f"{streak} consecutive years"
@@ -55,6 +105,11 @@ def compute_safety_score(
     fcf_payout: float | None,
     streak: int,
     debt_to_equity: float | None,
+    *,
+    stockholders_equity: float | None = None,
+    net_debt: float | None = None,
+    free_cash_flow: float | None = None,
+    operating_cash_flow: float | None = None,
 ) -> tuple[int | None, str, list[dict]]:
     """
     Dividend safety score with FCF payout weighted >= earnings payout.
@@ -77,9 +132,16 @@ def compute_safety_score(
         score, note = _score_earnings_payout(earnings_payout)
         weighted.append((score, 20, "Earnings Payout", note))
 
-    if debt_to_equity is not None and debt_to_equity > 0:
-        score, note = _score_debt_to_equity(debt_to_equity)
-        weighted.append((score, 20, "Debt/Equity", note))
+    leverage = score_balance_sheet_leverage(
+        debt_to_equity,
+        stockholders_equity=stockholders_equity,
+        net_debt=net_debt,
+        free_cash_flow=free_cash_flow,
+        operating_cash_flow=operating_cash_flow,
+    )
+    if leverage is not None:
+        score, category, note = leverage
+        weighted.append((score, 20, category, note))
 
     if streak > 0:
         score, note = _score_streak(streak)

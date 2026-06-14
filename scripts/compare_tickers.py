@@ -14,6 +14,8 @@ Runs the same core logic as nb_03 (dividend safety) and nb_05 (DDM/DCF/reverse D
   - DDM suppressed when yield < 2% or FCF payout > 90%
   - Reverse DCF implied growth at current price
   - yfinance FCF payout when SEC data is missing or unreliable
+  - Negative book equity → Net Debt/FCF leverage (MO-style buyback issuers)
+  - Optional qualitative flags (patent cliff, Amazon transition, etc.)
 """
 from __future__ import annotations
 
@@ -43,6 +45,7 @@ from utils.data_loader import (  # noqa: E402
     read_fundamentals_source,
     _to_annual,
 )
+from utils.qualitative_flags import format_qualitative_flags  # noqa: E402
 from utils.valuation import (  # noqa: E402
     compute_dcf,
     compute_ddm,
@@ -314,12 +317,26 @@ def analyze_ticker(ticker: str, ref: dict[str, str] | None = None) -> TickerComp
     debt_to_equity = None
     if "DebtToEquity" in annual.columns:
         de = annual["DebtToEquity"].dropna()
-        de = de[de > 0]
         if not de.empty:
             debt_to_equity = float(de.iloc[-1])
 
+    def _f(col: str) -> float | None:
+        if col not in latest.index:
+            return None
+        v = latest.get(col)
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return None
+        return float(v)
+
     row.safety_score, row.safety_label, _ = compute_safety_score(
-        row.earnings_payout, row.fcf_payout_used, row.div_streak, debt_to_equity
+        row.earnings_payout,
+        row.fcf_payout_used,
+        row.div_streak,
+        debt_to_equity,
+        stockholders_equity=_f("StockholdersEquity"),
+        net_debt=_f("NetDebt"),
+        free_cash_flow=_f("FreeCashFlow"),
+        operating_cash_flow=_f("OperatingCashFlow"),
     )
 
     use_ddm, ddm_reason = ddm_applicable(row.div_yield, row.fcf_payout_used)
@@ -437,6 +454,11 @@ def print_report(df: pd.DataFrame) -> None:
             print(f"   DDM skipped: {row['DDM Skip Reason']}")
         if row["Notes"]:
             print(f"   Note: {row['Notes']}")
+        qual = format_qualitative_flags(str(row["Ticker"]))
+        if qual:
+            print("   Qualitative flags:")
+            for line in qual.split("\n"):
+                print(f"     · {line}")
 
     aligned = (df["Alignment"] == "aligned").sum()
     partial = (df["Alignment"] == "partial").sum()
