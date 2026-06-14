@@ -1,4 +1,4 @@
-"""Golden tests for Phase 1 annual aggregation fixes."""
+"""Golden tests for Phase 1 annual aggregation fixes and Phase 2 yfinance fallback."""
 from __future__ import annotations
 
 import os
@@ -14,6 +14,8 @@ from utils.data_loader import (  # noqa: E402
     _to_annual,
     filter_complete_annual,
     load_fundamentals,
+    load_ticker_data,
+    read_fundamentals_source,
 )
 
 
@@ -91,3 +93,16 @@ def test_pep_latest_dps_complete_year():
     annual = _annual_for("PEP")
     latest_dps = float(annual["DividendsPerShare"].dropna().iloc[-1])
     assert latest_dps > 4.0, f"PEP DPS looks like a partial year: {latest_dps}"
+
+
+def test_asml_yfinance_fallback():
+    data = load_ticker_data("ASML")
+    assert data["meta"]["data_source"] == "yfinance"
+    assert read_fundamentals_source("ASML") == "yfinance"
+    assert not data["quarterly"].empty
+    annual = data["annual"]
+    assert not annual.empty
+    assert float(annual["Revenue"].dropna().iloc[-1]) > 10e9
+    fcf_pay = annual["FCFPayoutRatio"].dropna()
+    assert not fcf_pay.empty
+    assert 0.05 < float(fcf_pay.iloc[-1]) < 0.60

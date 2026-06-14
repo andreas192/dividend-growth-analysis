@@ -37,7 +37,7 @@ from utils.data_loader import (  # noqa: E402
     fetch_meta,
     filter_complete_annual,
     load_fundamentals,
-    load_ticker_data,
+    read_fundamentals_source,
     _to_annual,
 )
 
@@ -121,6 +121,7 @@ class TickerComparison:
     alignment: str = ""
     data_notes: list[str] = field(default_factory=list)
     sec_available: bool = False
+    data_source: str = ""
 
 
 def _quiet(func, default=None):
@@ -319,9 +320,10 @@ def analyze_ticker(ticker: str, ref: dict[str, str] | None = None) -> TickerComp
     row.div_streak = streak
 
     quarterly = load_fundamentals(ticker)
-    row.sec_available = not quarterly.empty
+    row.data_source = read_fundamentals_source(ticker)
+    row.sec_available = row.data_source == "sec"
     if quarterly.empty:
-        row.data_notes.append("No SEC fundamentals (foreign ADR or missing CIK)")
+        row.data_notes.append("No fundamentals (SEC or yfinance)")
         row.fcf_payout_used = yf_fcf_pay
         row.fcf_payout_source = "yfinance" if yf_fcf_pay else "none"
         row.notebook_signal = notebook_signal(None, "N/A", yf_fcf_pay, row.div_yield)
@@ -329,6 +331,9 @@ def analyze_ticker(ticker: str, ref: dict[str, str] | None = None) -> TickerComp
         if yf_fcf_pay and yf_fcf_pay > 1.0:
             row.safety_score, row.safety_label = compute_safety_score(None, yf_fcf_pay, streak, None)
         return row
+
+    if row.data_source == "yfinance":
+        row.data_notes.append("Fundamentals from yfinance (non-SEC issuer)")
 
     annual = filter_complete_annual(_to_annual(quarterly))
     if annual.empty:
@@ -380,10 +385,10 @@ def analyze_ticker(ticker: str, ref: dict[str, str] | None = None) -> TickerComp
             row.fcf_payout_source = "yfinance"
         else:
             row.fcf_payout_used = row.fcf_payout_sec
-            row.fcf_payout_source = "sec"
+            row.fcf_payout_source = row.data_source if row.data_source == "yfinance" else "sec"
     elif row.fcf_payout_sec is not None:
         row.fcf_payout_used = row.fcf_payout_sec
-        row.fcf_payout_source = "sec"
+        row.fcf_payout_source = row.data_source if row.data_source == "yfinance" else "sec"
 
     debt_to_equity = None
     if "DebtToEquity" in annual.columns:
@@ -457,7 +462,7 @@ def comparison_to_dataframe(rows: list[TickerComparison]) -> pd.DataFrame:
             "DCF MoS": r.dcf_mos,
             "Notebook Signal": r.notebook_signal,
             "Alignment": r.alignment,
-            "SEC Data": r.sec_available,
+            "Data Source": r.data_source or ("sec" if r.sec_available else "none"),
             "Notes": "; ".join(r.data_notes),
         })
     return pd.DataFrame(records)

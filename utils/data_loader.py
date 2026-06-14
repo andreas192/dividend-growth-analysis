@@ -106,20 +106,233 @@ def load_prices(ticker: str, years: int = 10) -> pd.DataFrame:
 
 # ── Fundamentals helpers ──────────────────────────────────────────────────────
 
-def load_fundamentals(ticker: str, refresh: bool = False) -> pd.DataFrame:
-    """Load cached quarterly fundamentals or fetch from SEC EDGAR."""
+_FUNDAMENTALS_SOURCE_FILE = "{ticker}_source.txt"
+
+# yfinance statement row names → canonical columns (first match wins)
+_YF_INCOME_ROWS: dict[str, list[str]] = {
+    "Revenue": ["Total Revenue", "Operating Revenue"],
+    "NetIncomeLoss": [
+        "Net Income Common Stockholders",
+        "Net Income",
+        "Net Income From Continuing Operation Net Minority Interest",
+    ],
+    "EarningsPerShareBasic": ["Basic EPS", "Diluted EPS"],
+}
+_YF_CASHFLOW_ROWS: dict[str, list[str]] = {
+    "OperatingCashFlow": ["Operating Cash Flow"],
+    "CapExRaw": ["Capital Expenditure"],
+    "FreeCashFlow": ["Free Cash Flow"],
+}
+_YF_BALANCE_ROWS: dict[str, list[str]] = {
+    "CashAndCashEquivalents": [
+        "Cash And Cash Equivalents",
+        "Cash Cash Equivalents And Short Term Investments",
+    ],
+    "TotalDebt": ["Total Debt"],
+    "StockholdersEquity": ["Stockholders Equity", "Common Stock Equity"],
+    "SharesOutstanding": ["Ordinary Shares Number", "Share Issued"],
+}
+
+
+def _fundamentals_source_path(ticker: str) -> str:
+    return os.path.join(FUNDAMENTALS_DIR, _FUNDAMENTALS_SOURCE_FILE.format(ticker=ticker.upper()))
+
+
+def read_fundamentals_source(ticker: str) -> str:
+    """Return ``sec`` or ``yfinance`` for cached fundamentals, else ``unknown``."""
+    path = _fundamentals_source_path(ticker)
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as fh:
+            return fh.read().strip() or "unknown"
+    return "unknown"
+
+
+def _write_fundamentals_source(ticker: str, source: str) -> None:
     os.makedirs(FUNDAMENTALS_DIR, exist_ok=True)
-    path = os.path.join(FUNDAMENTALS_DIR, f"{ticker.upper()}_quarterly.csv")
+    with open(_fundamentals_source_path(ticker), "w", encoding="utf-8") as fh:
+        fh.write(source)
+
+
+def _pick_yf_row(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    if df is None or df.empty:
+        return None
+    for name in candidates:
+        if name in df.index:
+            return name
+    lower = {str(idx).lower(): idx for idx in df.index}
+    for name in candidates:
+        key = name.lower()
+        if key in lower:
+            return lower[key]
+    return None
+
+
+def _yf_cell(df: pd.DataFrame, row: str | None, col) -> float | None:
+    if row is None or df is None or df.empty or col not in df.columns:
+        return None
+    val = df.loc[row, col]
+    if pd.isna(val):
+        return None
+    return float(val)
+
+
+def _fp_from_end(end: pd.Timestamp) -> str:
+    return f"Q{(end.month - 1) // 3 + 1}"
+
+
+def _annual_dps_from_history(ticker: str) -> dict[int, float]:
+    """Calendar-year DPS totals from yfinance dividend payments."""
+    try:
+        import yfinance as yf
+
+        raw = _quiet(lambda: yf.Ticker(ticker).dividends, None)
+        if raw is None or raw.empty:
+            return {}
+        if hasattr(raw.index, "tz") and raw.index.tz is not None:
+            raw.index = raw.index.tz_localize(None)
+        annual = raw.resample("YE").sum()
+        return {int(ts.year): float(val) for ts, val in annual.items() if val > 0}
+    except Exception:
+        return {}
+
+
+def _fill_row_from_statements(
+    row: dict,
+    col,
+    income: pd.DataFrame | None,
+    cashflow: pd.DataFrame | None,
+    balance: pd.DataFrame | None,
+) -> None:
+    for stmt, mapping in (
+        (income, _YF_INCOME_ROWS),
+        (cashflow, _YF_CASHFLOW_ROWS),
+        (balance, _YF_BALANCE_ROWS),
+    ):
+        if stmt is None or stmt.empty or col not in stmt.columns:
+            continue
+        for canonical, candidates in mapping.items():
+            if canonical in row:
+                continue
+            yf_row = _pick_yf_row(stmt, candidates)
+            val = _yf_cell(stmt, yf_row, col)
+            if val is not None:
+                row[canonical] = val
+
+
+def _derive_fundamental_fields(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    if "OperatingCashFlow" in out.columns and "CapExRaw" in out.columns and "FreeCashFlow" not in out.columns:
+        out["FreeCashFlow"] = out["OperatingCashFlow"] - out["CapExRaw"].abs()
+    if "DividendsPerShare" in out.columns and "EarningsPerShareBasic" in out.columns:
+        out["EarningsPayoutRatio"] = (
+            out["DividendsPerShare"] / out["EarningsPerShareBasic"].replace(0, float("nan"))
+        )
+    if "CashAndCashEquivalents" in out.columns and "TotalDebt" in out.columns:
+        out["NetDebt"] = out["TotalDebt"].fillna(0) - out["CashAndCashEquivalents"].fillna(0)
+    if "TotalDebt" in out.columns and "StockholdersEquity" in out.columns:
+        out["DebtToEquity"] = out["TotalDebt"].fillna(0) / out["StockholdersEquity"].replace(0, float("nan"))
+    return out
+
+
+def _fetch_yfinance_fundamentals(ticker: str, years: int = 10) -> pd.DataFrame:
+    """Build a quarterly fundamentals frame from yfinance statements (non-SEC issuers)."""
+    import yfinance as yf
+
+    t = yf.Ticker(ticker)
+    q_income = _quiet(lambda: t.quarterly_financials, None)
+    q_cashflow = _quiet(lambda: t.quarterly_cashflow, None)
+    q_balance = _quiet(lambda: t.quarterly_balance_sheet, None)
+    a_income = _quiet(lambda: t.financials, None)
+    a_cashflow = _quiet(lambda: t.cashflow, None)
+    a_balance = _quiet(lambda: t.balance_sheet, None)
+
+    stmt_sets = [
+        q_income,
+        q_cashflow,
+        q_balance,
+        a_income,
+        a_cashflow,
+        a_balance,
+    ]
+    if all(s is None or s.empty for s in stmt_sets):
+        return pd.DataFrame()
+
+    cutoff = pd.Timestamp.today() - pd.DateOffset(years=years)
+    annual_dps = _annual_dps_from_history(ticker)
+    records: list[dict] = []
+    seen: set[tuple[pd.Timestamp, str]] = set()
+
+    def add_record(end: pd.Timestamp, fp: str, col, income, cashflow, balance) -> None:
+        key = (end.normalize(), fp)
+        if key in seen or end < cutoff:
+            return
+        row: dict = {
+            "end": end.normalize(),
+            "fp": fp,
+            "fy": int(end.year),
+            "form": "yfinance",
+            "quarter": end.to_period("Q"),
+        }
+        _fill_row_from_statements(row, col, income, cashflow, balance)
+        if fp == "FY" and end.year in annual_dps:
+            row["DividendsPerShare"] = annual_dps[end.year]
+        if len(row) > 5:
+            seen.add(key)
+            records.append(row)
+
+    for stmt in (q_income, q_cashflow, q_balance):
+        if stmt is None or stmt.empty:
+            continue
+        for col in stmt.columns:
+            end = pd.Timestamp(col).normalize()
+            add_record(end, _fp_from_end(end), col, q_income, q_cashflow, q_balance)
+
+    for stmt in (a_income, a_cashflow, a_balance):
+        if stmt is None or stmt.empty:
+            continue
+        for col in stmt.columns:
+            end = pd.Timestamp(col).normalize()
+            add_record(end, "FY", col, a_income, a_cashflow, a_balance)
+
+    if not records:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(records)
+    df["end"] = pd.to_datetime(df["end"])
+    df = df.sort_values(["end", "fp"]).reset_index(drop=True)
+    return _derive_fundamental_fields(df)
+
+
+def load_fundamentals(ticker: str, refresh: bool = False) -> pd.DataFrame:
+    """Load cached quarterly fundamentals; SEC EDGAR first, yfinance when SEC has no data."""
+    os.makedirs(FUNDAMENTALS_DIR, exist_ok=True)
+    ticker = ticker.upper()
+    path = os.path.join(FUNDAMENTALS_DIR, f"{ticker}_quarterly.csv")
     if os.path.exists(path) and not refresh:
         df = pd.read_csv(path, parse_dates=["end"])
-        # Cached files without fiscal-period metadata predate Phase 1 aggregation fixes.
         if not df.empty and "fp" in df.columns and "fy" in df.columns:
             return df
 
-    from reports.reports import build_quarterly_df
-    df = build_quarterly_df(ticker)
+    df = pd.DataFrame()
+    source = "sec"
+    try:
+        from reports.reports import build_quarterly_df
+
+        df = build_quarterly_df(ticker)
+    except Exception:
+        df = pd.DataFrame()
+
+    if df.empty:
+        df = _fetch_yfinance_fundamentals(ticker)
+        source = "yfinance" if not df.empty else "none"
+    else:
+        source = "sec"
+
     if not df.empty:
         df.to_csv(path, index=False)
+        _write_fundamentals_source(ticker, source)
     return df
 
 
@@ -425,6 +638,10 @@ def load_ticker_data(ticker: str, years: int = 10) -> dict[str, pd.DataFrame | d
     quarterly = load_fundamentals(ticker)
     annual    = filter_complete_annual(_to_annual(quarterly))
     meta      = fetch_meta(ticker)
+    source    = read_fundamentals_source(ticker)
+    if quarterly.empty:
+        source = "none"
+    meta["data_source"] = source
     return {
         "prices":    prices,
         "quarterly": quarterly,
