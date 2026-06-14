@@ -12,6 +12,13 @@ SEC_HEADERS = {
 }
 YEARS = 10
 
+_PER_SHARE_METRICS = frozenset({
+    "EarningsPerShareBasic",
+    "EarningsPerShareDiluted",
+    "CommonStockDividendsPerShareCashPaid",
+    "CommonStockDividendsPerShareDeclared",
+})
+
 
 # ── CIK resolution ────────────────────────────────────────────────────────────
 
@@ -48,10 +55,30 @@ def fetch_sec_companyfacts(cik: str) -> dict:
 
 # ── Single concept extraction ─────────────────────────────────────────────────
 
+def _dedupe_end_fp(df: pd.DataFrame, concept: str) -> pd.DataFrame:
+    """Collapse duplicate (end, fp) rows; prefer quarterly increment over YTD cumulative."""
+    if concept not in _PER_SHARE_METRICS:
+        grouped = df.groupby(["end", "fp"], as_index=False).agg(
+            {concept: "max", "fy": "last", "form": "last"}
+        )
+        return grouped
+
+    rows: list[pd.Series] = []
+    for (end, fp), grp in df.groupby(["end", "fp"]):
+        vals = grp[concept].dropna()
+        if vals.empty:
+            continue
+        val = float(vals.max()) if fp == "FY" else float(vals.min())
+        row = grp.iloc[-1].copy()
+        row[concept] = val
+        rows.append(row)
+    return pd.DataFrame(rows).reset_index(drop=True)
+
+
 def extract_quarterly_metric(
     companyfacts: dict,
     concept: str,
-    preferred_unit: str = "USD",
+    preferred_unit: str | list[str] = "USD",
 ) -> pd.DataFrame:
     facts = companyfacts.get("facts", {}).get("us-gaap", {})
     if concept not in facts:
@@ -61,7 +88,14 @@ def extract_quarterly_metric(
     if not units:
         return pd.DataFrame()
 
-    records = units.get(preferred_unit) or units[next(iter(units))]
+    unit_prefs = [preferred_unit] if isinstance(preferred_unit, str) else preferred_unit
+    records = None
+    for unit_key in unit_prefs:
+        if unit_key in units:
+            records = units[unit_key]
+            break
+    if records is None:
+        records = units[next(iter(units))]
     df = pd.DataFrame(records)
     if df.empty or "end" not in df.columns or "val" not in df.columns:
         return pd.DataFrame()
@@ -72,20 +106,30 @@ def extract_quarterly_metric(
     if "fp" in df.columns:
         df = df[df["fp"].isin(["Q1", "Q2", "Q3", "Q4", "FY"])]
 
-    df = df[["end", "val"]].rename(columns={"val": concept})
+    meta_cols = [c for c in ["end", "fp", "fy", "form", "val"] if c in df.columns]
+    df = df[meta_cols].rename(columns={"val": concept})
     df = df.dropna(subset=["end", concept]).copy()
     if df.empty:
         return pd.DataFrame()
 
+    if "fp" in df.columns:
+        df = _dedupe_end_fp(df, concept)
+    else:
+        df["quarter"] = df["end"].dt.to_period("Q")
+        df = df.sort_values("end").drop_duplicates(subset=["quarter"], keep="last")
+
     df["quarter"] = df["end"].dt.to_period("Q")
-    df = df.sort_values("end").drop_duplicates(subset=["quarter"], keep="last")
-    return df[["end", "quarter", concept]]
+    out_cols = ["end", "quarter", concept]
+    for col in ("fp", "fy", "form"):
+        if col in df.columns:
+            out_cols.append(col)
+    return df[out_cols]
 
 
 def extract_first_available_metric(
     companyfacts: dict,
     concept_candidates: list[str],
-    preferred_unit: str = "USD",
+    preferred_unit: str | list[str] = "USD",
     min_end: pd.Timestamp | None = None,
 ) -> tuple[pd.DataFrame, str | None]:
     canonical_name = concept_candidates[0]
@@ -155,9 +199,31 @@ CONCEPT_MAP: dict[str, list[str]] = {
         "InterestAndDebtExpense",
     ],
     "SharesOutstanding": [
+        "WeightedAverageNumberOfSharesOutstandingBasic",
         "CommonStockSharesOutstanding",
     ],
 }
+
+# Preferred XBRL units per metric (first match wins).
+METRIC_UNITS: dict[str, list[str]] = {
+    "Revenue": ["USD"],
+    "NetIncomeLoss": ["USD"],
+    "EarningsPerShareBasic": ["USD/shares", "pure"],
+    "OperatingCashFlow": ["USD"],
+    "CapExRaw": ["USD"],
+    "DividendsPerShare": ["USD/shares", "pure"],
+    "CashAndCashEquivalents": ["USD"],
+    "TotalDebt": ["USD"],
+    "StockholdersEquity": ["USD"],
+    "InterestExpense": ["USD"],
+    "SharesOutstanding": ["shares"],
+}
+
+
+def _metric_merge_keys(df: pd.DataFrame) -> list[str]:
+    if "fp" in df.columns and df["fp"].notna().any():
+        return ["end", "fp"]
+    return ["end"]
 
 
 def build_quarterly_df(ticker: str, years: int = YEARS) -> pd.DataFrame:
@@ -172,49 +238,51 @@ def build_quarterly_df(ticker: str, years: int = YEARS) -> pd.DataFrame:
 
     frames: dict[str, pd.DataFrame] = {}
     for canonical, candidates in CONCEPT_MAP.items():
-        df, _ = extract_first_available_metric(facts, candidates, min_end=cutoff)
-        if not df.empty:
-            # extract_first_available_metric renames to candidates[0]; map to our canonical key
-            col_in_df = candidates[0]
-            if col_in_df in df.columns:
-                df = df.rename(columns={col_in_df: canonical})
-            if canonical in df.columns:
-                frames[canonical] = df.set_index("quarter")[[canonical]]
+        units = METRIC_UNITS.get(canonical, ["USD"])
+        df, _ = extract_first_available_metric(facts, candidates, preferred_unit=units, min_end=cutoff)
+        if df.empty:
+            continue
+        col_in_df = candidates[0]
+        if col_in_df in df.columns:
+            df = df.rename(columns={col_in_df: canonical})
+        if canonical not in df.columns:
+            continue
+        keep = [c for c in ["end", "quarter", "fy", "fp", "form", canonical] if c in df.columns]
+        frames[canonical] = df[keep].copy()
 
     if not frames:
         return pd.DataFrame()
 
-    base = None
+    spine_name = "Revenue" if "Revenue" in frames else next(iter(frames))
+    base = frames[spine_name].copy()
+    merge_keys = _metric_merge_keys(base)
+
     for name, df in frames.items():
-        if base is None:
-            base = df
-        else:
-            base = base.join(df, how="outer")
+        if name == spine_name:
+            continue
+        cols = merge_keys + [name]
+        cols = [c for c in cols if c in df.columns]
+        piece = df[cols].drop_duplicates(subset=merge_keys, keep="last")
+        base = base.merge(piece, on=merge_keys, how="outer")
 
-    if base is None or base.empty:
-        return pd.DataFrame()
+    if "end" not in base.columns or base["end"].isna().all():
+        base["end"] = base["quarter"].apply(lambda q: q.to_timestamp(how="end").normalize())
 
-    # Re-attach end dates
-    end_dates: dict[str, pd.Timestamp] = {}
-    for name, df in frames.items():
-        df2 = df.copy()
-        if "end" in df2.columns:
-            end_dates.update(df2["end"].to_dict())
-
-    base = base.reset_index()
-    # Rebuild end from quarter
-    base["end"] = base["quarter"].apply(lambda q: q.to_timestamp(how="end").normalize())
-    base = base[base["end"] >= cutoff].sort_values("end").reset_index(drop=True)
+    base = base[base["end"] >= cutoff].sort_values(
+        ["end", "fp"] if "fp" in base.columns else ["end"]
+    )
+    base = base.reset_index(drop=True)
 
     # Derived metrics
     if "OperatingCashFlow" in base.columns and "CapExRaw" in base.columns:
         base["FreeCashFlow"] = base["OperatingCashFlow"] - base["CapExRaw"].abs()
 
-    if "NetIncomeLoss" in base.columns and "DividendsPerShare" in base.columns:
+    if (
+        "DividendsPerShare" in base.columns
+        and "EarningsPerShareBasic" in base.columns
+    ):
         base["EarningsPayoutRatio"] = (
             base["DividendsPerShare"] / base["EarningsPerShareBasic"].replace(0, float("nan"))
-            if "EarningsPerShareBasic" in base.columns
-            else float("nan")
         )
 
     if "CashAndCashEquivalents" in base.columns and "TotalDebt" in base.columns:

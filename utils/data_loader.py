@@ -106,13 +106,14 @@ def load_prices(ticker: str, years: int = 10) -> pd.DataFrame:
 
 # ── Fundamentals helpers ──────────────────────────────────────────────────────
 
-def load_fundamentals(ticker: str) -> pd.DataFrame:
+def load_fundamentals(ticker: str, refresh: bool = False) -> pd.DataFrame:
     """Load cached quarterly fundamentals or fetch from SEC EDGAR."""
     os.makedirs(FUNDAMENTALS_DIR, exist_ok=True)
     path = os.path.join(FUNDAMENTALS_DIR, f"{ticker.upper()}_quarterly.csv")
-    if os.path.exists(path):
+    if os.path.exists(path) and not refresh:
         df = pd.read_csv(path, parse_dates=["end"])
-        if not df.empty:
+        # Cached files without fiscal-period metadata predate Phase 1 aggregation fixes.
+        if not df.empty and "fp" in df.columns and "fy" in df.columns:
             return df
 
     from reports.reports import build_quarterly_df
@@ -157,41 +158,197 @@ def fetch_meta(ticker: str) -> dict:
 
 # ── Annual aggregation ────────────────────────────────────────────────────────
 
+_FLOW_COLS = [
+    "Revenue", "NetIncomeLoss", "OperatingCashFlow", "CapExRaw",
+    "FreeCashFlow", "InterestExpense",
+]
+_SNAP_COLS = [
+    "CashAndCashEquivalents", "TotalDebt", "StockholdersEquity",
+    "NetDebt", "DebtToEquity", "SharesOutstanding",
+]
+_PER_SHARE_COLS = ["DividendsPerShare", "EarningsPerShareBasic"]
+
+
+def filter_complete_annual(annual: pd.DataFrame) -> pd.DataFrame:
+    """Drop partial current-year rows and obvious partial-year revenue artifacts."""
+    if annual.empty:
+        return annual
+    a = annual.copy()
+    current_year = pd.Timestamp.today().year
+    if "year" in a.columns:
+        a = a[a["year"] < current_year]
+    if "Revenue" in a.columns:
+        rev = a["Revenue"].dropna()
+        if not rev.empty:
+            med = rev.median()
+            a = a[(a["Revenue"].isna()) | (a["Revenue"] >= med * 0.25)]
+    return a.reset_index(drop=True)
+
+
+def _annual_year(quarterly: pd.DataFrame) -> pd.Series:
+    """Calendar year from period-end date (SEC fy tags are inconsistent across concepts)."""
+    return pd.to_datetime(quarterly["end"]).dt.year
+
+
+def _pick_fy_value(grp: pd.DataFrame, col: str) -> float | None:
+    if col not in grp.columns or "fp" not in grp.columns:
+        return None
+    fy_rows = grp[grp["fp"] == "FY"]
+    if fy_rows.empty:
+        return None
+    latest_end = fy_rows["end"].max()
+    at_end = fy_rows.loc[fy_rows["end"] == latest_end, col].dropna()
+    if not at_end.empty:
+        return float(at_end.max())
+    vals = fy_rows[col].dropna()
+    return float(vals.max()) if not vals.empty else None
+
+
+def _pick_quarterly_sum(grp: pd.DataFrame, col: str) -> float | None:
+    if col not in grp.columns:
+        return None
+    if "fp" not in grp.columns:
+        vals = grp[col].dropna()
+        return float(vals.sum()) if not vals.empty else None
+
+    q = grp[grp["fp"].isin(["Q1", "Q2", "Q3", "Q4"])]
+    if q.empty:
+        return None
+
+    vals = q.groupby("fp")[col].last().dropna()
+    if vals.empty:
+        return None
+
+    # Q4 often carries the full-year total instead of a true quarter.
+    q4 = vals["Q4"] if "Q4" in vals.index else None
+    q13 = vals.reindex(["Q1", "Q2", "Q3"]).dropna()
+    if q4 is not None and not q13.empty and q4 >= q13.sum() * 0.9:
+        return float(q4)
+
+    return float(vals.sum())
+
+
+def _pick_per_share_annual(grp: pd.DataFrame, col: str) -> float | None:
+    fy_val = _pick_fy_value(grp, col)
+    if fy_val is not None:
+        return fy_val
+    return _pick_quarterly_sum(grp, col)
+
+
+def _pick_snapshot(grp: pd.DataFrame, col: str) -> float | None:
+    if col not in grp.columns:
+        return None
+    ordered = grp.sort_values("end")
+    if "fp" in ordered.columns:
+        for fp in ("FY", "Q4", "Q3", "Q2", "Q1"):
+            snap = ordered.loc[ordered["fp"] == fp, col].dropna()
+            if not snap.empty:
+                return float(snap.iloc[-1])
+    vals = ordered[col].dropna()
+    return float(vals.iloc[-1]) if not vals.empty else None
+
+
+def _legacy_annual_row(grp: pd.DataFrame, year: int) -> dict:
+    """Fallback when quarterly rows lack fp/fy metadata (old cache)."""
+    flow_cols = [c for c in _FLOW_COLS if c in grp.columns]
+    snap_cols = [c for c in _SNAP_COLS if c in grp.columns]
+    row: dict = {"year": year}
+
+    for col in flow_cols:
+        vals = grp[col].dropna()
+        if vals.empty:
+            continue
+        q4 = vals.iloc[-1]
+        q_rest = vals.iloc[:-1]
+        row[col] = float(q4) if len(vals) > 1 and q4 >= q_rest.sum() * 0.9 else float(vals.sum())
+
+    for col in snap_cols:
+        val = _pick_snapshot(grp, col)
+        if val is not None:
+            row[col] = val
+
+    for col in _PER_SHARE_COLS:
+        if col not in grp.columns:
+            continue
+        vals = grp[col].dropna()
+        if not vals.empty:
+            row[col] = float(vals.max()) if col == "EarningsPerShareBasic" else float(vals.sum())
+
+    if "end" in grp.columns:
+        row["end"] = grp["end"].max()
+    return row
+
+
 def _to_annual(quarterly: pd.DataFrame) -> pd.DataFrame:
     """
-    Aggregate quarterly data to annual (calendar year).
-    Sums flow metrics; takes last-of-year snapshot for balance sheet items.
+    Aggregate quarterly SEC data to fiscal-year totals.
+
+    Flow metrics prefer FY (10-K) rows; DPS sums quarters or uses FY;
+    EPS uses FY; balance-sheet items use the latest snapshot in the year.
     """
     if quarterly.empty:
         return pd.DataFrame()
 
     q = quarterly.copy()
-    q["year"] = pd.to_datetime(q["end"]).dt.year
+    q["end"] = pd.to_datetime(q["end"])
+    q["year"] = _annual_year(q)
+    q = q.dropna(subset=["year"])
+    q["year"] = q["year"].astype(int)
 
-    flow_cols = [c for c in ["Revenue", "NetIncomeLoss", "OperatingCashFlow", "CapExRaw",
-                              "FreeCashFlow", "InterestExpense"] if c in q.columns]
-    snap_cols = [c for c in ["CashAndCashEquivalents", "TotalDebt", "StockholdersEquity",
-                              "NetDebt", "DebtToEquity", "SharesOutstanding"] if c in q.columns]
+    has_fp = "fp" in q.columns and q["fp"].notna().any()
+    flow_cols = [c for c in _FLOW_COLS if c in q.columns]
+    snap_cols = [c for c in _SNAP_COLS if c in q.columns]
 
-    agg_dict = {c: "sum" for c in flow_cols}
-    agg_dict.update({c: "last" for c in snap_cols})
-    # DPS & EPS: take max per year — 10-K annual totals are always the largest value in the year
-    for col in ["DividendsPerShare", "EarningsPerShareBasic"]:
-        if col in q.columns:
-            agg_dict[col] = "max"
-    if "end" in q.columns:
-        agg_dict["end"] = "last"
+    rows: list[dict] = []
+    for year, grp in q.groupby("year", sort=True):
+        if has_fp:
+            row: dict = {"year": year}
+            for col in flow_cols:
+                val = _pick_fy_value(grp, col)
+                if val is None:
+                    val = _pick_quarterly_sum(grp, col)
+                if val is not None:
+                    row[col] = val
 
-    annual = q.groupby("year").agg(agg_dict).reset_index()
+            for col in _PER_SHARE_COLS:
+                if col in grp.columns:
+                    val = _pick_per_share_annual(grp, col)
+                    if val is not None:
+                        row[col] = val
 
-    # Re-derive payout ratios on annual basis
+            for col in snap_cols:
+                val = _pick_snapshot(grp, col)
+                if val is not None:
+                    row[col] = val
+
+            if "end" in grp.columns:
+                row["end"] = grp["end"].max()
+            rows.append(row)
+        else:
+            rows.append(_legacy_annual_row(grp, year))
+
+    annual = pd.DataFrame(rows)
+
+    if "OperatingCashFlow" in annual.columns and "CapExRaw" in annual.columns and "FreeCashFlow" not in annual.columns:
+        annual["FreeCashFlow"] = annual["OperatingCashFlow"] - annual["CapExRaw"].abs()
+
     if "DividendsPerShare" in annual.columns and "EarningsPerShareBasic" in annual.columns:
         annual["EarningsPayoutRatio"] = (
             annual["DividendsPerShare"] / annual["EarningsPerShareBasic"].replace(0, float("nan"))
         )
-    if "DividendsPerShare" in annual.columns and "FreeCashFlow" in annual.columns and "SharesOutstanding" in annual.columns:
+    if (
+        "DividendsPerShare" in annual.columns
+        and "FreeCashFlow" in annual.columns
+        and "SharesOutstanding" in annual.columns
+    ):
         annual["FCFPerShare"] = annual["FreeCashFlow"] / annual["SharesOutstanding"].replace(0, float("nan"))
         annual["FCFPayoutRatio"] = annual["DividendsPerShare"] / annual["FCFPerShare"].replace(0, float("nan"))
+
+    if "TotalDebt" in annual.columns and "StockholdersEquity" in annual.columns:
+        annual["DebtToEquity"] = annual["TotalDebt"].fillna(0) / annual["StockholdersEquity"].replace(0, float("nan"))
+
+    if "CashAndCashEquivalents" in annual.columns and "TotalDebt" in annual.columns:
+        annual["NetDebt"] = annual["TotalDebt"].fillna(0) - annual["CashAndCashEquivalents"].fillna(0)
 
     return annual
 
@@ -266,7 +423,7 @@ def load_ticker_data(ticker: str, years: int = 10) -> dict[str, pd.DataFrame | d
     ticker = ticker.upper()
     prices    = load_prices(ticker, years=years)
     quarterly = load_fundamentals(ticker)
-    annual    = _to_annual(quarterly)
+    annual    = filter_complete_annual(_to_annual(quarterly))
     meta      = fetch_meta(ticker)
     return {
         "prices":    prices,

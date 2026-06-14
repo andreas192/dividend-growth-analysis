@@ -5,7 +5,7 @@ Shared configuration and formatting helpers for the dividend-growth analysis sui
 """
 
 # ── Primary analysis target ──────────────────────────────────────────────────
-TICKER = "PEP"          # Change to any US ticker, e.g. "MSFT", "AAPL", "KO"
+TICKER = "ZTS"          # Change to any US ticker, e.g. "MSFT", "AAPL", "KO"
 
 # ── Valuation assumptions (used in nb_05 and nb_06) ─────────────────────────
 REQUIRED_RETURN = 0.09          # Discount rate / required annual return (9%)
