@@ -8,8 +8,11 @@ Usage
     python scripts/compare_tickers.py --tickers PEP UNH MO
     python scripts/compare_tickers.py --csv data/dividendology_compare.csv
 
-Runs the same core logic as nb_03 (dividend safety) and nb_05 (DDM/DCF), with:
+Runs the same core logic as nb_03 (dividend safety) and nb_05 (DDM/DCF/reverse DCF), with:
   - Partial calendar years excluded from annual metrics
+  - FCF payout weighted >= earnings in safety score (shared utils/valuation.py)
+  - DDM suppressed when yield < 2% or FCF payout > 90%
+  - Reverse DCF implied growth at current price
   - yfinance FCF payout when SEC data is missing or unreliable
 """
 from __future__ import annotations
@@ -39,6 +42,13 @@ from utils.data_loader import (  # noqa: E402
     load_fundamentals,
     read_fundamentals_source,
     _to_annual,
+)
+from utils.valuation import (  # noqa: E402
+    compute_dcf,
+    compute_ddm,
+    compute_reverse_dcf,
+    compute_safety_score,
+    ddm_applicable,
 )
 
 warnings.filterwarnings("ignore")
@@ -117,6 +127,9 @@ class TickerComparison:
     ddm_mos: float | None = None
     dcf_fv: float | None = None
     dcf_mos: float | None = None
+    reverse_dcf_growth: float | None = None
+    ddm_skipped: bool = False
+    ddm_skip_reason: str = ""
     notebook_signal: str = ""
     alignment: str = ""
     data_notes: list[str] = field(default_factory=list)
@@ -165,72 +178,6 @@ def yfinance_fcf_payout(ticker: str) -> tuple[float | None, float | None, float 
     return None, None, fcf
 
 
-def compute_safety_score(
-    earnings_payout: float | None,
-    fcf_payout: float | None,
-    streak: int,
-    debt_to_equity: float | None,
-) -> tuple[int | None, str]:
-    """Mirror nb_03 dividend safety scoring."""
-    scores: dict[str, int] = {}
-
-    if earnings_payout is not None and earnings_payout > 0:
-        pr = earnings_payout
-        if pr < 0.40:
-            scores["Earnings Payout"] = 100
-        elif pr < 0.60:
-            scores["Earnings Payout"] = 85
-        elif pr < 0.75:
-            scores["Earnings Payout"] = 65
-        elif pr < 1.0:
-            scores["Earnings Payout"] = 40
-        else:
-            scores["Earnings Payout"] = 10
-
-    if fcf_payout is not None and fcf_payout > 0:
-        v = fcf_payout
-        if v < 0.50:
-            scores["FCF Payout"] = 100
-        elif v < 0.75:
-            scores["FCF Payout"] = 75
-        elif v < 1.0:
-            scores["FCF Payout"] = 45
-        else:
-            scores["FCF Payout"] = 10
-
-    if debt_to_equity is not None and debt_to_equity > 0:
-        v = debt_to_equity
-        if v < 0.5:
-            scores["Debt/Equity"] = 100
-        elif v < 1.0:
-            scores["Debt/Equity"] = 80
-        elif v < 2.0:
-            scores["Debt/Equity"] = 55
-        else:
-            scores["Debt/Equity"] = 25
-
-    if streak >= 25:
-        scores["Growth Streak"] = 100
-    elif streak >= 10:
-        scores["Growth Streak"] = 75
-    elif streak >= 5:
-        scores["Growth Streak"] = 50
-    elif streak > 0:
-        scores["Growth Streak"] = 25
-
-    if not scores:
-        return None, "N/A"
-
-    overall = int(np.mean(list(scores.values())))
-    label = (
-        "VERY SAFE" if overall >= 80
-        else "SAFE" if overall >= 60
-        else "MODERATE" if overall >= 40
-        else "RISKY"
-    )
-    return overall, label
-
-
 def notebook_signal(
     safety_score: int | None,
     safety_label: str,
@@ -264,32 +211,6 @@ def alignment_notebook_vs_dividendology(notebook: str, dividendology: str) -> st
     if (nb.startswith("bullish") and dl == "bearish") or (nb == "bearish" and dl == "bullish"):
         return "conflict"
     return "partial"
-
-
-def compute_ddm(latest_dps: float, div_growth: float, price: float | None) -> tuple[float | None, float | None]:
-    g = max(0.01, min(div_growth, 0.20))
-    if REQUIRED_RETURN <= g:
-        return None, None
-    d1 = latest_dps * (1 + g)
-    fv = d1 / (REQUIRED_RETURN - g)
-    mos = (fv - price) / price if price else None
-    return fv, mos
-
-
-def compute_dcf(fcf_ps: float, fcf_growth: float, price: float | None) -> tuple[float | None, float | None]:
-    g = max(0.01, min(fcf_growth, 0.25))
-    r, tg = REQUIRED_RETURN, TERMINAL_GROWTH_RATE
-    if r <= tg:
-        return None, None
-    pv = 0.0
-    fcf_n = fcf_ps
-    for _ in range(10):
-        fcf_n *= 1 + g
-        pv += fcf_n / ((1 + r) ** (_ + 1))
-    tv = fcf_n * (1 + tg) / (r - tg)
-    fv = pv + tv / ((1 + r) ** 10)
-    mos = (fv - price) / price if price else None
-    return fv, mos
 
 
 def analyze_ticker(ticker: str, ref: dict[str, str] | None = None) -> TickerComparison:
@@ -329,7 +250,7 @@ def analyze_ticker(ticker: str, ref: dict[str, str] | None = None) -> TickerComp
         row.notebook_signal = notebook_signal(None, "N/A", yf_fcf_pay, row.div_yield)
         row.alignment = alignment_notebook_vs_dividendology(row.notebook_signal, row.dividendology_stance)
         if yf_fcf_pay and yf_fcf_pay > 1.0:
-            row.safety_score, row.safety_label = compute_safety_score(None, yf_fcf_pay, streak, None)
+            row.safety_score, row.safety_label, _ = compute_safety_score(None, yf_fcf_pay, streak, None)
         return row
 
     if row.data_source == "yfinance":
@@ -397,12 +318,17 @@ def analyze_ticker(ticker: str, ref: dict[str, str] | None = None) -> TickerComp
         if not de.empty:
             debt_to_equity = float(de.iloc[-1])
 
-    row.safety_score, row.safety_label = compute_safety_score(
+    row.safety_score, row.safety_label, _ = compute_safety_score(
         row.earnings_payout, row.fcf_payout_used, row.div_streak, debt_to_equity
     )
 
-    if row.latest_dps and row.div_cagr_5y is not None and row.price:
+    use_ddm, ddm_reason = ddm_applicable(row.div_yield, row.fcf_payout_used)
+    if row.latest_dps and row.div_cagr_5y is not None and row.price and use_ddm:
         row.ddm_fv, row.ddm_mos = compute_ddm(row.latest_dps, row.div_cagr_5y, row.price)
+    elif not use_ddm:
+        row.ddm_skipped = True
+        row.ddm_skip_reason = ddm_reason
+        row.data_notes.append(f"DDM skipped: {ddm_reason}")
 
     fcf_ps = None
     if "FreeCashFlow" in annual.columns and "SharesOutstanding" in latest.index:
@@ -423,6 +349,8 @@ def analyze_ticker(ticker: str, ref: dict[str, str] | None = None) -> TickerComp
                     5,
                 )
         row.dcf_fv, row.dcf_mos = compute_dcf(fcf_ps, fcf_g, row.price)
+        if row.price:
+            row.reverse_dcf_growth = compute_reverse_dcf(fcf_ps, row.price)
 
     row.notebook_signal = notebook_signal(
         row.safety_score, row.safety_label, row.fcf_payout_used, row.div_yield
@@ -460,6 +388,9 @@ def comparison_to_dataframe(rows: list[TickerComparison]) -> pd.DataFrame:
             "DDM MoS": r.ddm_mos,
             "DCF FV": r.dcf_fv,
             "DCF MoS": r.dcf_mos,
+            "Reverse DCF g": r.reverse_dcf_growth,
+            "DDM Skipped": r.ddm_skipped,
+            "DDM Skip Reason": r.ddm_skip_reason,
             "Notebook Signal": r.notebook_signal,
             "Alignment": r.alignment,
             "Data Source": r.data_source or ("sec" if r.sec_available else "none"),
@@ -500,6 +431,10 @@ def print_report(df: pd.DataFrame) -> None:
             mos = row["DCF MoS"] * 100
             tag = "discount" if mos > 0 else "premium"
             print(f"   DCF fair value: ${row['DCF FV']:.0f} ({abs(mos):.0f}% {tag} vs price)")
+        if pd.notna(row.get("Reverse DCF g")):
+            print(f"   Reverse DCF implied FCF growth: {row['Reverse DCF g']*100:.1f}%")
+        if row.get("DDM Skip Reason"):
+            print(f"   DDM skipped: {row['DDM Skip Reason']}")
         if row["Notes"]:
             print(f"   Note: {row['Notes']}")
 
